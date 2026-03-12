@@ -12,6 +12,10 @@ const spinner = ora('');
 
 module.exports = async function downloadReport(url, format, width, height, filename, authType, username, password, tenant, multitenancy, time, transport, emailbody, timeout) {
   spinner.start('Connecting to url ' + url);
+
+  // Allow self-signed certificates
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
   try {
     const browser = await puppeteer.launch({
       headless: true,
@@ -24,7 +28,9 @@ module.exports = async function downloadReport(url, format, width, height, filen
         '--font-render-hinting=none',
         '--enable-features=NetworkService',
         '--ignore-certificate-errors',
-        '--single-process'
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-blink-features=AutomationControlled'
       ],
       executablePath: process.env.CHROMIUM_PATH,
       ignoreHTTPSErrors: true,
@@ -54,7 +60,7 @@ module.exports = async function downloadReport(url, format, width, height, filen
     }
     // no auth
     else {
-      await page.goto(url, { waitUntil: 'networkidle0' });
+      await page.goto(url, { waitUntil: 'networkidle2' });
     }
 
     spinner.info('Connected to url ' + url);
@@ -68,6 +74,7 @@ module.exports = async function downloadReport(url, format, width, height, filen
 
     // if its an OpenSearch report, remove extra elements.
     if (reportSource !== 'Other' && reportSource !== 'Saved search') {
+      try {
       await page.evaluate(
         (reportSource, REPORT_TYPE) => {
           // remove buttons.
@@ -90,6 +97,9 @@ module.exports = async function downloadReport(url, format, width, height, filen
         reportSource,
         REPORT_TYPE
       );
+      } catch (evalErr) {
+        spinner.warn('Could not clean up page elements: ' + evalErr.message);
+      }
     }
 
     // force wait for any resize to load after the above DOM modification.
@@ -202,8 +212,20 @@ const getUrl = async (url) => {
 };
 
 const basicAuthentication = async (page, overridePage, url, username, password, tenant, multitenancy) => {
-  await page.goto(url, { waitUntil: 'networkidle0' });
-  await new Promise(resolve => setTimeout(resolve, 10000));
+  // Strategy 1: Try HTTP Basic Auth headers first (works when server uses HTTP 401 challenges)
+  // This sets the Authorization: Basic header on every request automatically.
+  await page.authenticate({ username, password });
+  spinner.info('Set HTTP Basic Auth headers');
+
+  await page.goto(url, { waitUntil: 'networkidle2', timeout: 120000 });
+  await new Promise(resolve => setTimeout(resolve, 5000));
+
+  // Check if we landed on a login form (form-based auth) instead of the dashboard
+  const loginForm = await page.$('input[data-test-subj="user-name"]');
+
+  if (loginForm !== null) {
+    // Strategy 2: Fall back to form-based login if a login form is detected
+    spinner.info('Login form detected, using form-based authentication');
   await page.type('input[data-test-subj="user-name"]', username);
   await page.type('[data-test-subj="password"]', password);
   await page.click('button[type=submit]');
@@ -233,22 +255,48 @@ const basicAuthentication = async (page, overridePage, url, username, password, 
     await page.click('button[data-test-subj="confirm"]');
     await page.waitForTimeout(25000);
   }
-  await overridePage.goto(url, { waitUntil: 'networkidle0' });
+    await overridePage.goto(url, { waitUntil: 'networkidle2' });
   await overridePage.waitForTimeout(5000);
 
-  if (multitenancy === true  && tenantSelection !== null) {
+    if (multitenancy === true && tenantSelection !== null) {
     // Check if tenant was selected successfully.
     if ((await overridePage.$('button[data-test-subj="confirm"]')) !== null) {
       spinner.fail('Invalid tenant');
       exit(1);
     }
   }
-  await page.goto(url, { waitUntil: 'networkidle0' });
-  await page.reload({ waitUntil: 'networkidle0' });
+    await page.goto(url, { waitUntil: 'networkidle2' });
+    await page.reload({ waitUntil: 'networkidle2' });
+  } else {
+    // HTTP Basic Auth headers worked, dashboard loaded directly
+    spinner.info('HTTP Basic Auth successful, dashboard loaded');
+
+    // Handle tenant selection if it appears after HTTP auth
+    const tenantSelection = await page.$('button[data-test-subj="confirm"]');
+    if (multitenancy === true && tenantSelection !== null) {
+      try {
+        if (tenant === 'global' || tenant === 'private') {
+          await page.click('label[for=' + tenant + ']');
+        } else {
+          await page.click('label[for="custom"]');
+          await page.click('button[data-test-subj="comboBoxToggleListButton"]');
+          await page.type('input[data-test-subj="comboBoxSearchInput"]', tenant);
+        }
+        await page.waitForTimeout(2000);
+        await page.click('button[data-test-subj="confirm"]');
+        await page.waitForTimeout(10000);
+      } catch (tenantErr) {
+        spinner.warn('Tenant selection skipped: ' + tenantErr.message);
+      }
+    }
+
+    // Wait for dashboard content to fully load
+    await new Promise(resolve => setTimeout(resolve, 10000));
+  }
 };
 
 const samlAuthentication = async (page, url, username, password, tenant, multitenancy) => {
-  await page.goto(url, { waitUntil: 'networkidle0' });
+  await page.goto(url, { waitUntil: 'networkidle2' });
   await new Promise(resolve => setTimeout(resolve, 10000));
   let refUrl;
   await getUrl(url).then((value) => {
@@ -283,11 +331,11 @@ const samlAuthentication = async (page, url, username, password, tenant, multite
     await page.waitForTimeout(25000);
   }
   await page.click(`a[href='${refUrl}']`);
-  await page.reload({ waitUntil: 'networkidle0' });
+  await page.reload({ waitUntil: 'networkidle2' });
 }
 
 const cognitoAuthentication = async (page, overridePage, url, username, password, tenant, multitenancy) => {
-  await page.goto(url, { waitUntil: 'networkidle0' });
+  await page.goto(url, { waitUntil: 'networkidle2' });
   await new Promise(resolve => setTimeout(resolve, 10000));
   await page.type('[name="username"]', username);
   await page.type('[name="password"]', password);
@@ -317,7 +365,7 @@ const cognitoAuthentication = async (page, overridePage, url, username, password
     await page.click('button[data-test-subj="confirm"]');
     await page.waitForTimeout(25000);
   }
-  await overridePage.goto(url, { waitUntil: 'networkidle0' });
+  await overridePage.goto(url, { waitUntil: 'networkidle2' });
   await overridePage.waitForTimeout(5000);
 
   if (multitenancy === true  && tenantSelection !== null) {
@@ -327,8 +375,8 @@ const cognitoAuthentication = async (page, overridePage, url, username, password
       exit(1);
     }
   }
-  await page.goto(url, { waitUntil: 'networkidle0' });
-  await page.reload({ waitUntil: 'networkidle0' });
+  await page.goto(url, { waitUntil: 'networkidle2' });
+  await page.reload({ waitUntil: 'networkidle2' });
 }
 
 const readStreamToFile = async (
